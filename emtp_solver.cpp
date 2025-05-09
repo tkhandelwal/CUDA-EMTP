@@ -763,11 +763,11 @@ bool EMTPSolver::runSimulation(bool useRealTimeWeb) {
         auto now = std::chrono::system_clock::now();
         auto now_c = std::chrono::system_clock::to_time_t(now);
         std::tm timeInfo;
-#ifdef _WIN32
+    #ifdef _WIN32
         localtime_s(&timeInfo, &now_c);
-#else
+    #else
         localtime_r(&now_c, &timeInfo);
-#endif
+    #endif
         char timeBuffer[80];
         std::strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%d %H:%M:%S", &timeInfo);
 
@@ -1071,6 +1071,9 @@ bool EMTPSolver::runSimulation(bool useRealTimeWeb) {
     }
 
     simulationRunning.store(false);
+    log("==== SIMULATION COMPLETE ====");
+    resultsCV.notify_all();  // Signal any waiting threads
+
 
     // Stop visualization thread
     if (realTimeVisualization && !dataCommunicator) {
@@ -1079,6 +1082,14 @@ bool EMTPSolver::runSimulation(bool useRealTimeWeb) {
 
     // Print performance metrics
     printPerformanceMetrics();
+
+    // Before export - verify results contain data
+    std::cout << "Exporting data for " << results.nodeVoltages.size() << " nodes\n";
+    for (const auto& node : results.nodeVoltages) {
+        std::cout << "Node " << node.first << " has " << node.second.size()
+            << " voltage points (first value: " << node.second[0] << ")\n";
+        break; // Just show first node
+    }
 
     // Export to database
     log("Exporting results to database");
@@ -1098,7 +1109,7 @@ bool EMTPSolver::initializeFromLoadflow() {
     // Create a realistic set of initial conditions
 
     // Set phase angles based on network topology to create a valid starting point
-    double baseVoltage = 1.0;  // Per unit
+    double baseVoltage = 345.0;  // using actual voltage
     double baseAngle = 0.0;    // Radians
     double angleStep = 2.0 * M_PI / nodeNames.size();  // Distribute angles 
 
@@ -1106,7 +1117,8 @@ bool EMTPSolver::initializeFromLoadflow() {
 
     for (const auto& node : nodeNames) {
         // Set realistic magnitude based on nominal voltage
-        double nominalVoltage = 1.0;  // Default 1.0 pu
+        double nominalVoltage = nodeNominalVoltages.find(node) != nodeNominalVoltages.end() ?
+            nodeNominalVoltages[node] : baseVoltage;
 
         if (nodeNominalVoltages.find(node) != nodeNominalVoltages.end()) {
             nominalVoltage = nodeNominalVoltages[node];
@@ -1135,7 +1147,7 @@ bool EMTPSolver::initializeFromLoadflow() {
         for (auto& subnetwork : subnetworks) {
             int localIndex = subnetwork->getLocalNodeIndex(nodeNameToIndex[node]);
             if (localIndex >= 0) {
-                subnetwork->setNodeVoltage(localIndex, initialVoltage);
+                subnetwork->setNodeVoltage(localIndex, nominalVoltage);
             }
         }
 
