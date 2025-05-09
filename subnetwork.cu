@@ -529,264 +529,328 @@ void Subnetwork::updateCurrentVector(double time) {
 }
 
 void Subnetwork::solveLinearSystem() {
-    // Create stream for detailed logging
-    std::ofstream logStream("subnetwork_" + std::to_string(id) + "_solver_log.txt",
-        std::ios::app);
+    std::cout << "[" << getCurrentTimeString() << "] SOLVER: Starting linear system solution for subnetwork " << id << std::endl;
+    std::cout << "[" << getCurrentTimeString() << "] SOLVER: Matrix size = " << numNodes << "x" << numNodes
+        << " with " << h_values.size() << " non-zeros" << std::endl;
 
-    auto logMessage = [&](const std::string& message) {
-        // Simple timestamp without put_time
-        auto now = std::chrono::system_clock::now();
-        std::time_t now_c = std::chrono::system_clock::to_time_t(now);
-        char timeStr[20];
-        std::strftime(timeStr, sizeof(timeStr), "%H:%M:%S", std::localtime(&now_c));
+    // Set CUDA device
+    cudaError_t err = cudaSetDevice(deviceID);
+    if (err != cudaSuccess) {
+        std::cerr << "[" << getCurrentTimeString() << "] SOLVER ERROR: Failed to set CUDA device "
+            << deviceID << ": " << cudaGetErrorString(err) << std::endl;
+        throw std::runtime_error("CUDA device selection failed in solver");
+    }
 
-        std::string fullMessage = std::string("[") + timeStr + "] Function: " + message;
-        std::cout << fullMessage << std::endl;
-        logStream << fullMessage << std::endl;
-        };
+    // Check matrix structure validity
+    if (h_rowPtr.size() != numNodes + 1) {
+        std::cerr << "[" << getCurrentTimeString() << "] SOLVER ERROR: Invalid row pointer size. Expected "
+            << (numNodes + 1) << ", got " << h_rowPtr.size() << std::endl;
 
-    // Start performance tracking
-    auto startTime = std::chrono::high_resolution_clock::now();
-    logMessage("Starting linear system solution");
+        // If this happens, try to fix it
+        std::cout << "[" << getCurrentTimeString() << "] SOLVER: Reinitializing matrix structure" << std::endl;
+        initializeMatrixStructure();
+        return;  // Exit and try again in the next iteration
+    }
 
-    if (d_values.size() > 0 && d_rowPtr.size() > 0 && d_colInd.size() > 0) {
-        logMessage("Matrix initialized with " + std::to_string(d_values.size()) + " non-zeros");
+    // Verify values size matches non-zero count
+    if (h_colInd.size() != h_values.size()) {
+        std::cerr << "[" << getCurrentTimeString() << "] SOLVER ERROR: Column indices and values size mismatch: "
+            << h_colInd.size() << " vs " << h_values.size() << std::endl;
+        return;  // Exit and try again in the next iteration
+    }
 
-        // Get raw pointers for CUDA calls
-        double* d_valsPtr = thrust::raw_pointer_cast(d_values.data());
-        int* d_rowPtrRaw = thrust::raw_pointer_cast(d_rowPtr.data());
-        int* d_colIndPtr = thrust::raw_pointer_cast(d_colInd.data());
-        double* d_currentsPtr = thrust::raw_pointer_cast(d_currents.data());
-        double* d_voltagesPtr = thrust::raw_pointer_cast(d_voltages.data());
+    // Prepare device pointers with error checking
+    double* d_valuesPtr = nullptr;
+    int* d_rowPtrPtr = nullptr;
+    int* d_colIndPtr = nullptr;
+    double* d_currentsPtr = nullptr;
+    double* d_voltagesPtr = nullptr;
 
-        // Copy currents to host for inspection
-        logMessage("Copying currents to host for inspection");
-        thrust::copy(d_currents.begin(), d_currents.end(), h_currents.begin());
+    try {
+        d_valuesPtr = thrust::raw_pointer_cast(d_values.data());
+        d_rowPtrPtr = thrust::raw_pointer_cast(d_rowPtr.data());
+        d_colIndPtr = thrust::raw_pointer_cast(d_colInd.data());
+        d_currentsPtr = thrust::raw_pointer_cast(d_currents.data());
+        d_voltagesPtr = thrust::raw_pointer_cast(d_voltages.data());
+    }
+    catch (const std::exception& e) {
+        std::cerr << "[" << getCurrentTimeString() << "] SOLVER ERROR: Failed to get raw pointers: "
+            << e.what() << std::endl;
+        return;
+    }
 
-        // Check if the current vector contains all zeros or very small values
-        bool allZerosOrSmall = true;
-        double smallThreshold = 1e-10;
-        double maxCurrent = 0.0;
-        double minCurrent = 0.0;
+    // Sanity check device pointers
+    if (!d_valuesPtr || !d_rowPtrPtr || !d_colIndPtr || !d_currentsPtr || !d_voltagesPtr) {
+        std::cerr << "[" << getCurrentTimeString() << "] SOLVER ERROR: One or more device pointers are null" << std::endl;
+        return;
+    }
 
-        for (const auto& current : h_currents) {
-            if (std::abs(current) > smallThreshold) {
-                allZerosOrSmall = false;
-            }
-            maxCurrent = std::max(maxCurrent, current);
-            minCurrent = std::min(minCurrent, current);
+    // Debug: Log the current vector values
+    std::cout << "[" << getCurrentTimeString() << "] SOLVER: Current vector (first 5 elements): ";
+    for (int i = 0; i < std::min(5, numNodes); i++) {
+        std::cout << h_currents[i] << " ";
+    }
+    std::cout << std::endl;
+
+    // Check for NaN or Inf in current vector
+    bool has_bad_value = false;
+    for (int i = 0; i < numNodes; i++) {
+        if (std::isnan(h_currents[i]) || std::isinf(h_currents[i])) {
+            std::cerr << "[" << getCurrentTimeString() << "] SOLVER ERROR: Invalid value in current vector at index "
+                << i << ": " << h_currents[i] << std::endl;
+            has_bad_value = true;
+            h_currents[i] = 0.0;  // Replace with zero
         }
+    }
 
-        logMessage("Current vector stats: min=" + std::to_string(minCurrent) +
-            ", max=" + std::to_string(maxCurrent));
+    if (has_bad_value) {
+        std::cout << "[" << getCurrentTimeString() << "] SOLVER: Fixed invalid values in current vector" << std::endl;
+        d_currents = h_currents;  // Update device copy
+        d_currentsPtr = thrust::raw_pointer_cast(d_currents.data());
+    }
 
-        if (allZerosOrSmall) {
-            // If all currents are zero or very small, set a small non-zero value
-            // to at least one element to avoid singular system
-            double smallInjection = 1e-6;
-            logMessage("WARNING: All currents near zero, adding small injection of " +
-                std::to_string(smallInjection) + " to current[0]");
-            h_currents[0] = smallInjection;
-            thrust::copy(h_currents.begin(), h_currents.end(), d_currents.begin());
-        }
+    // Copy matrix to host for inspection and modification
+    std::cout << "[" << getCurrentTimeString() << "] SOLVER: Copying matrix for diagonal boosting" << std::endl;
+    thrust::host_vector<double> h_values_copy = d_values;
 
-        // Create info structure for solver
-        cusolverSpHandle_t handle = cusolverHandle;
-        logMessage("Using cuSolver handle " + std::to_string((uint64_t)handle));
-
-        // Add error handling for solver
-        int singularity = 0;
-
-        // Allocate d_info if not already allocated
-        if (!d_info) {
-            logMessage("Allocating d_info");
-            cudaError_t err = cudaMalloc(&d_info, sizeof(int));
-            if (err != cudaSuccess) {
-                logMessage("CUDA error allocating d_info: " + std::string(cudaGetErrorString(err)));
-                throw std::runtime_error("CUDA memory allocation failed");
-            }
-        }
-
-        // Try with diagonal boosting for better conditioning
-        // Copy matrix values to host for manipulation
-        logMessage("Copying matrix values to host for diagonal boosting");
-        thrust::host_vector<double> h_vals_copy = d_values;
-
-        // Boost diagonal entries for better conditioning
-        double diagonalBoostValue = 1e-4; // Increased from 1e-6 for better conditioning
-        int diagonalCount = 0;
-
-        for (int i = 0; i < numNodes; i++) {
-            bool foundDiagonal = false;
-            for (int j = h_rowPtr[i]; j < h_rowPtr[i + 1]; j++) {
-                if (h_colInd[j] == i) {
-                    // Add small value to diagonal to improve conditioning
-                    h_vals_copy[j] += diagonalBoostValue;
-                    foundDiagonal = true;
-                    diagonalCount++;
-                    break;
-                }
-            }
-
-            if (!foundDiagonal) {
-                logMessage("WARNING: No diagonal element found for row " + std::to_string(i));
+    // Add small values to diagonal for stability
+    int diagonalBoostCount = 0;
+    for (int i = 0; i < numNodes; i++) {
+        bool foundDiagonal = false;
+        // Find diagonal entry
+        for (int j = h_rowPtr[i]; j < h_rowPtr[i + 1]; j++) {
+            if (h_colInd[j] == i) {
+                // Add small value to diagonal for stability
+                h_values_copy[j] += 0.0001;
+                diagonalBoostCount++;
+                foundDiagonal = true;
+                break;
             }
         }
 
-        logMessage("Boosted " + std::to_string(diagonalCount) + " diagonal elements by " +
-            std::to_string(diagonalBoostValue));
-
-        // Copy boosted matrix back to device
-        logMessage("Copying boosted matrix back to device");
-        thrust::copy(h_vals_copy.begin(), h_vals_copy.end(), d_values.begin());
-
-        // Try Cholesky factorization with improved matrix
-        logMessage("Calling cusolverSpDcsrlsvchol");
-        cusolverStatus_t status;
-        try {
-            status = cusolverSpDcsrlsvchol(
-                handle,
-                numNodes,             // Number of rows
-                h_rowPtr.size() - 1,  // Number of non-zeros
-                matDescr,             // Matrix descriptor
-                d_valsPtr,            // Matrix values
-                d_rowPtrRaw,          // Row pointers
-                d_colIndPtr,          // Column indices
-                d_currentsPtr,        // Right-hand side (currents)
-                1e-10,                // Tolerance
-                0,                    // Reordering
-                d_voltagesPtr,        // Solution (voltages)
-                d_info                // Singularity (output)
-            );
+        // If diagonal not found, report error
+        if (!foundDiagonal) {
+            std::cerr << "[" << getCurrentTimeString() << "] SOLVER ERROR: Diagonal element missing for row "
+                << i << std::endl;
         }
-        catch (const std::exception& e) {
-            logMessage("Exception during solver call: " + std::string(e.what()));
-            throw;
+    }
+
+    std::cout << "[" << getCurrentTimeString() << "] SOLVER: Boosted " << diagonalBoostCount
+        << " diagonal elements by 0.0001" << std::endl;
+
+    // Copy boosted values back to device
+    d_values = h_values_copy;
+    d_valuesPtr = thrust::raw_pointer_cast(d_values.data());
+
+    // Ensure d_info is allocated
+    if (!d_info) {
+        std::cout << "[" << getCurrentTimeString() << "] SOLVER: Allocating d_info" << std::endl;
+        cudaMalloc(&d_info, sizeof(int));
+    }
+
+    // Initialize voltage vector with zeros or previous solution
+    std::cout << "[" << getCurrentTimeString() << "] SOLVER: Initializing voltage vector" << std::endl;
+    if (iterationsPerformed == 0 && time_step_index == 0) {
+        // First iteration of first time step - use zeros
+        thrust::fill(d_voltages.begin(), d_voltages.end(), 0.0);
+    }
+    else {
+        // Use previous values as initial guess
+        d_voltages = h_voltages;
+    }
+
+    // Try QR factorization instead of Cholesky
+    std::cout << "[" << getCurrentTimeString() << "] SOLVER: Using QR factorization" << std::endl;
+
+    // Step 1: Calculate buffer sizes
+    size_t internalDataInBytes = 0;
+    size_t workspaceInBytes = 0;
+
+    cusolverStatus_t status = cusolverSpDcsrlsvqr_bufferSize(
+        cusolverHandle, numNodes, h_values.size(),
+        matDescr, d_valuesPtr, d_rowPtrPtr, d_colIndPtr,
+        d_currentsPtr, 0.0001, // Tolerance
+        1, // Reorder
+        d_voltagesPtr,
+        &internalDataInBytes, &workspaceInBytes);
+
+    if (status != CUSOLVER_STATUS_SUCCESS) {
+        std::cerr << "[" << getCurrentTimeString() << "] SOLVER ERROR: Buffer size calculation failed, status = "
+            << status << std::endl;
+        // Use previous voltages as fallback
+        std::cout << "[" << getCurrentTimeString() << "] SOLVER: Using previous voltages as fallback" << std::endl;
+        h_voltages = prev_voltages;
+        d_voltages = h_voltages;
+        return;
+    }
+
+    std::cout << "[" << getCurrentTimeString() << "] SOLVER: Buffer sizes: internal = "
+        << internalDataInBytes << ", workspace = " << workspaceInBytes << std::endl;
+
+    // Allocate workspace
+    void* buffer = nullptr;
+    if (workspaceInBytes > 0) {
+        err = cudaMalloc(&buffer, workspaceInBytes);
+        if (err != cudaSuccess) {
+            std::cerr << "[" << getCurrentTimeString() << "] SOLVER ERROR: Workspace allocation failed: "
+                << cudaGetErrorString(err) << std::endl;
+            // Use previous voltages as fallback
+            h_voltages = prev_voltages;
+            d_voltages = h_voltages;
+            return;
+        }
+        std::cout << "[" << getCurrentTimeString() << "] SOLVER: Allocated workspace buffer of "
+            << workspaceInBytes << " bytes" << std::endl;
+    }
+
+    // Step 2: Solve the system using QR factorization
+    std::cout << "[" << getCurrentTimeString() << "] SOLVER: Calling cusolverSpDcsrlsvqr" << std::endl;
+    status = cusolverSpDcsrlsvqr(
+        cusolverHandle, numNodes, h_values.size(),
+        matDescr, d_valuesPtr, d_rowPtrPtr, d_colIndPtr,
+        d_currentsPtr, 0.0001, // Tolerance
+        1, // Reorder
+        d_voltagesPtr,
+        d_info, buffer);
+
+    // Check solver status
+    std::cout << "[" << getCurrentTimeString() << "] SOLVER: QR solver status = " << status << std::endl;
+
+    // Check for solve errors
+    int h_info = 0;
+    err = cudaMemcpy(&h_info, d_info, sizeof(int), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        std::cerr << "[" << getCurrentTimeString() << "] SOLVER ERROR: Failed to get solver info: "
+            << cudaGetErrorString(err) << std::endl;
+        h_info = -1;  // Assume error
+    }
+
+    std::cout << "[" << getCurrentTimeString() << "] SOLVER: Solver info = " << h_info << std::endl;
+
+    if (status != CUSOLVER_STATUS_SUCCESS || h_info != 0) {
+        std::cerr << "[" << getCurrentTimeString() << "] SOLVER ERROR: QR solver failed with status = "
+            << status << ", info = " << h_info << std::endl;
+
+        // Try LU solver as fallback
+        std::cout << "[" << getCurrentTimeString() << "] SOLVER: Trying LU solver as fallback" << std::endl;
+
+        // Ensure d_info is reset
+        int resetInfo = 0;
+        cudaMemcpy(d_info, &resetInfo, sizeof(int), cudaMemcpyHostToDevice);
+
+        // Call LU solver
+        status = cusolverSpDcsrlsvlu(
+            cusolverHandle, numNodes, h_values.size(),
+            matDescr, d_valuesPtr, d_rowPtrPtr, d_colIndPtr,
+            d_currentsPtr, 0.0001, // Tolerance
+            1, // Reorder
+            d_voltagesPtr,
+            d_info, buffer);
+
+        std::cout << "[" << getCurrentTimeString() << "] SOLVER: LU solver status = " << status << std::endl;
+
+        err = cudaMemcpy(&h_info, d_info, sizeof(int), cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            std::cerr << "[" << getCurrentTimeString() << "] SOLVER ERROR: Failed to get LU solver info: "
+                << cudaGetErrorString(err) << std::endl;
+            h_info = -1;
         }
 
-        // Check for CUDA errors
-        cudaError_t cudaErr = cudaGetLastError();
-        if (cudaErr != cudaSuccess) {
-            logMessage("CUDA error after solver: " + std::string(cudaGetErrorString(cudaErr)));
-        }
+        std::cout << "[" << getCurrentTimeString() << "] SOLVER: LU solver info = " << h_info << std::endl;
 
-        // Check for errors
-        if (status != CUSOLVER_STATUS_SUCCESS) {
-            logMessage("WARNING: cuSolver error, status: " + std::to_string(status));
+        if (status != CUSOLVER_STATUS_SUCCESS || h_info != 0) {
+            std::cerr << "[" << getCurrentTimeString() << "] SOLVER ERROR: Both QR and LU solvers failed" << std::endl;
 
-            // Fallback to iterative solver (QR) for more stability
-            logMessage("Falling back to simple diagonal solver");
-
-            // Use QMR or GMRES solver instead (this would need actual implementation)
-            // For now, we'll do a simple diagonal scaling fallback
-            for (int i = 0; i < numNodes; i++) {
-                // Extract diagonal element for scaling
-                double diag = 1.0; // Default
-                for (int j = h_rowPtr[i]; j < h_rowPtr[i + 1]; j++) {
-                    if (h_colInd[j] == i) {
-                        diag = h_vals_copy[j];
-                        break;
-                    }
-                }
-
-                // Simple scaling (on host)
-                if (std::abs(diag) > 1e-10) {
-                    h_voltages[i] = h_currents[i] / diag;
-                }
-                else {
-                    h_voltages[i] = h_currents[i] * 0.001;  // 1000 ohm impedance as fallback
-                }
-            }
-
-            // Copy back to device
-            logMessage("Copying fallback solution to device");
-            thrust::copy(h_voltages.begin(), h_voltages.end(), d_voltages.begin());
+            // Use previous values as final fallback
+            std::cout << "[" << getCurrentTimeString() << "] SOLVER: Using previous values as final fallback" << std::endl;
+            h_voltages = prev_voltages;
+            d_voltages = h_voltages;
         }
         else {
-            // Check for singularity
-            int h_singularity;
-            cudaMemcpy(&h_singularity, d_info, sizeof(int), cudaMemcpyDeviceToHost);
-            if (h_singularity != -1) {
-                logMessage("WARNING: Singular matrix detected at row: " + std::to_string(h_singularity));
-
-                // Apply fallback solution at singularity point
-                h_voltages[h_singularity] = 0.0; // Set to ground or a reasonable value
-
-                // Copy back to device
-                logMessage("Copying fixed solution to device after handling singularity");
-                thrust::copy(h_voltages.begin(), h_voltages.end(), d_voltages.begin());
+            // LU solve succeeded
+            std::cout << "[" << getCurrentTimeString() << "] SOLVER: LU solve succeeded" << std::endl;
+            try {
+                h_voltages = d_voltages;
             }
-            else {
-                // Copy results from device to host for checking/limiting
-                logMessage("Copying solution from device to host for validation");
-                thrust::copy(d_voltages.begin(), d_voltages.end(), h_voltages.begin());
-
-                // Log voltage statistics
-                double minVoltage = std::numeric_limits<double>::max();
-                double maxVoltage = std::numeric_limits<double>::lowest();
-                double sumVoltage = 0.0;
-
-                for (int i = 0; i < numNodes; i++) {
-                    minVoltage = std::min(minVoltage, h_voltages[i]);
-                    maxVoltage = std::max(maxVoltage, h_voltages[i]);
-                    sumVoltage += h_voltages[i];
-                }
-
-                logMessage("Voltage stats: min=" + std::to_string(minVoltage) +
-                    ", max=" + std::to_string(maxVoltage) +
-                    ", avg=" + std::to_string(sumVoltage / numNodes));
+            catch (const std::exception& e) {
+                std::cerr << "[" << getCurrentTimeString() << "] SOLVER ERROR: Failed to copy voltage result: "
+                    << e.what() << std::endl;
+                h_voltages = prev_voltages;
             }
-        }
-
-        // Check for unrealistic voltage values and limit them
-        bool voltageWasLimited = false;
-        double maxVoltage = 1000.0; // 1000 kV as an upper limit
-        int limitedCount = 0;
-
-        for (int i = 0; i < numNodes; i++) {
-            // Get the current voltage
-            double voltage = h_voltages[i];
-
-            // Perform sanity check on voltage value
-            if (std::isnan(voltage) || std::isinf(voltage) || std::abs(voltage) > maxVoltage) {
-                logMessage("WARNING: Invalid voltage value " + std::to_string(voltage) +
-                    " at node " + std::to_string(i));
-
-                // Use previous value or zero instead
-                h_voltages[i] = (voltage > 0) ? maxVoltage : -maxVoltage;
-                if (std::isnan(voltage) || std::isinf(voltage)) {
-                    h_voltages[i] = 0.0; // Reset to zero for NaN or infinity
-                }
-                voltageWasLimited = true;
-                limitedCount++;
-            }
-        }
-
-        if (voltageWasLimited) {
-            logMessage("WARNING: Limited " + std::to_string(limitedCount) +
-                " excessive voltage values");
-
-            // Copy back to device
-            logMessage("Copying limited voltage values back to device");
-            thrust::copy(h_voltages.begin(), h_voltages.end(), d_voltages.begin());
         }
     }
     else {
-        // If matrix is not initialized, use a simplified approach
-        logMessage("WARNING: Matrix not initialized, using direct copy approach");
-        // Here we just copy currents to voltages as a placeholder
-        thrust::copy(d_currents.begin(), d_currents.end(), d_voltages.begin());
+        // QR solve succeeded
+        std::cout << "[" << getCurrentTimeString() << "] SOLVER: QR solve succeeded" << std::endl;
+        try {
+            h_voltages = d_voltages;
+        }
+        catch (const std::exception& e) {
+            std::cerr << "[" << getCurrentTimeString() << "] SOLVER ERROR: Failed to copy voltage result: "
+                << e.what() << std::endl;
+            h_voltages = prev_voltages;
+        }
     }
 
-    // End performance tracking
-    auto endTime = std::chrono::high_resolution_clock::now();
-    double duration = std::chrono::duration<double>(endTime - startTime).count();
-    solverTime += duration;
+    // Free workspace
+    if (buffer) {
+        cudaFree(buffer);
+    }
 
-    logMessage("Linear system solution completed in " + std::to_string(duration) + " seconds");
-    logStream.close();
+    // Debug: Log the voltage vector values
+    std::cout << "[" << getCurrentTimeString() << "] SOLVER: Voltage vector (first 5 elements): ";
+    for (int i = 0; i < std::min(5, numNodes); i++) {
+        std::cout << h_voltages[i] << " ";
+    }
+    std::cout << std::endl;
+
+    // Check for NaN or Inf in voltage vector
+    has_bad_value = false;
+    for (int i = 0; i < numNodes; i++) {
+        if (std::isnan(h_voltages[i]) || std::isinf(h_voltages[i]) || std::abs(h_voltages[i]) > 1e6) {
+            std::cerr << "[" << getCurrentTimeString() << "] SOLVER ERROR: Invalid value in voltage vector at index "
+                << i << ": " << h_voltages[i] << std::endl;
+            has_bad_value = true;
+            // Replace with previous value
+            h_voltages[i] = prev_voltages[i];
+        }
+    }
+
+    if (has_bad_value) {
+        std::cout << "[" << getCurrentTimeString() << "] SOLVER: Fixed invalid values in voltage vector" << std::endl;
+    }
+
+    // Apply relaxation to improve convergence
+    if (iterationsPerformed > 0) {
+        // Adjusting relaxation factor based on iterations
+        double current_relaxation = relaxation_factor;
+        if (iterationsPerformed > 5) {
+            // More conservative relaxation for slow convergence
+            current_relaxation = std::max(0.5, relaxation_factor - 0.1);
+        }
+
+        std::cout << "[" << getCurrentTimeString() << "] SOLVER: Applying relaxation factor "
+            << current_relaxation << std::endl;
+
+        // Apply relaxation: v_new = alpha * v_calc + (1-alpha) * v_old
+        for (int i = 0; i < numNodes; i++) {
+            h_voltages[i] = current_relaxation * h_voltages[i] +
+                (1.0 - current_relaxation) * previous_iteration_voltages[i];
+        }
+    }
+
+    // Copy final voltages back to device
+    try {
+        d_voltages = h_voltages;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "[" << getCurrentTimeString() << "] SOLVER ERROR: Failed to update device voltages: "
+            << e.what() << std::endl;
+    }
+
+    std::cout << "[" << getCurrentTimeString() << "] SOLVER: Linear system solution completed for subnetwork "
+        << id << std::endl;
 }
-
 void Subnetwork::updateBranchCurrents() {
     // Enhanced function with proper current calculation
     if (numBranches > 0) {
