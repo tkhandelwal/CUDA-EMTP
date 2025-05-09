@@ -1105,6 +1105,7 @@ bool EMTPSolver::runSimulation(bool useRealTimeWeb) {
 
 bool EMTPSolver::initializeFromLoadflow() {
     std::cout << "Initializing simulation from load flow solution..." << std::endl;
+    std::cout << "*** SETTING NON-ZERO INITIAL VALUES ***\n";
 
     // Create a realistic set of initial conditions
 

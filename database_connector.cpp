@@ -217,6 +217,17 @@ bool DatabaseConnector::prepareStatements() {
 }
 
 bool DatabaseConnector::writeTimeStepData(const SimulationResults& results, int timeStep) {
+    // Before inserting data, print some diagnostics
+    std::cout << "DB insert: TimeStep " << timeStep << ", Time " << results.timePoints[timeStep] << std::endl;
+
+    // Print first few voltage values
+    for (const auto& node : results.nodeVoltages) {
+        if (timeStep < static_cast<int>(node.second.size())) {
+            std::cout << "  Node " << node.first << " voltage: " << node.second[timeStep] << std::endl;
+        }
+        break; // Just show the first node
+    }
+
     std::lock_guard<std::mutex> lock(dbMutex);
 
     if (db == nullptr) {
