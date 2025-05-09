@@ -21,8 +21,17 @@ class Subnetwork {
 private:
     int id;
     int deviceID;
+    int* d_info;  // Device memory for solver info/error codes
     cudaStream_t stream;
     double timeStep;
+
+    // Previous two sets of voltages for extrapolation
+    thrust::host_vector<double> prev_voltages;
+    thrust::host_vector<double> prev_prev_voltages;
+    int time_step_index = 0;
+
+    thrust::host_vector<double> previous_iteration_voltages;
+    double relaxation_factor = 0.7; // Adjust as needed: 0.5-0.8 works well
 
     // Node and branch mappings
     std::unordered_map<std::string, int> nodeMap;  // Maps node names to local indices

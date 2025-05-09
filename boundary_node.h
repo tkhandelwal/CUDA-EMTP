@@ -19,6 +19,7 @@ private:
     double currentVoltage;
     double previousVoltage;
 
+
     // Mutex for thread safety when updating values - marked mutable for const methods
     mutable std::mutex nodeMutex;
 

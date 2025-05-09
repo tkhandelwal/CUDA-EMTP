@@ -50,8 +50,43 @@ void TransmissionLine::updateHistoryTerms(double timeStep, double time) {
 }
 
 void TransmissionLine::calculateContributions() {
-    // In a full implementation, this would update the admittance matrix
-    // and current vector contributions for this transmission line
+    // Calculate characteristic impedance
+    double Z0 = sqrt(inductance / capacitance);
+
+    // Calculate propagation constant
+    double alpha = resistance / (2.0 * Z0); // Attenuation constant
+    double beta = 2.0 * M_PI * 60.0 * sqrt(inductance * capacitance); // Phase constant at 60 Hz
+
+    // Calculate shunt admittance
+    double Y = 1.0 / Z0;
+
+    // Calculate series impedance
+    double Z = Z0;
+
+    // Apply line length scaling
+    Z *= length;
+    Y *= length;
+
+    // Apply PI-model for transmission line
+    // Contributions to admittance matrix:
+    // Add Y/2 to diagonal elements for shunt admittance at both ends
+    // Add -1/Z to off-diagonal elements for series impedance
+    // Note: In a full implementation, these values would be added to
+    // the appropriate locations in the admittance matrix
+
+    // For branch current calculation, store these values for later use
+    // This data should be passed to the GPU for the kernel
+    double parameters[4] = { Z0, alpha, beta, length };
+
+    // Now update the history terms based on these parameters
+    double voltage_from = 0.0; // Would get from current solution
+    double voltage_to = 0.0;   // Would get from current solution
+
+    // Update history terms based on distributed parameter model
+    historyTermFrom = voltage_to * exp(-alpha * length) * cos(beta * length) -
+        voltage_from * exp(-alpha * length);
+    historyTermTo = voltage_from * exp(-alpha * length) * cos(beta * length) -
+        voltage_to * exp(-alpha * length);
 }
 
 void TransmissionLine::prepareDeviceData() {
