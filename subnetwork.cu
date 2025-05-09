@@ -415,45 +415,117 @@ void Subnetwork::updateHistoryTerms(double time) {
 void Subnetwork::updateCurrentVector(double time) {
     std::cout << "Updating current vector at time " << time << " for subnetwork " << id << std::endl;
 
+    // Input validation - critical for preventing CUDA errors
+    if (numNodes <= 0) {
+        std::cerr << "Error: Cannot launch kernel with numNodes = " << numNodes << std::endl;
+        return;
+    }
+
+    // Check that memory is allocated
+    if (d_currents.size() < numNodes) {
+        std::cerr << "Error: CUDA currents vector not properly sized (size: "
+            << d_currents.size() << ", required: " << numNodes << ")" << std::endl;
+        return;
+    }
+
+    // Get device properties to check maximum block size
+    cudaDeviceProp deviceProp;
+    cudaError_t propErr = cudaGetDeviceProperties(&deviceProp, deviceID);
+    if (propErr != cudaSuccess) {
+        std::cerr << "Error getting device properties: " << cudaGetErrorString(propErr) << std::endl;
+        return;
+    }
+
     // Reset the current vector first
     thrust::fill(d_currents.begin(), d_currents.end(), 0.0);
 
-    // Copy to host for manipulation
-    thrust::host_vector<double> h_currents_local(numNodes, 0.0);
+    // Choose calculation method:
+    // Option 1: Set values on host and copy to device
+    bool useHostCalculation = true;  // Set to false to test kernel approach instead
 
-    // Add source injections based on time
-    // This is a simplified example - in a real implementation, you would:
-    // 1. Loop through voltage sources and add their contributions
-    // 2. Add current source injections directly
-    // 3. Add history term contributions from elements with memory
+    if (useHostCalculation) {
+        // Create and initialize host vector
+        thrust::host_vector<double> h_currents_local(numNodes, 0.0);
 
-    // Example: Add a 1 A current injection to node 0 at 60 Hz
-    if (numNodes > 0) {
-        double amplitude = 1.0;  // 1 A
-        double frequency = 60.0; // 60 Hz
-        h_currents_local[0] = amplitude * sin(2.0 * M_PI * frequency * time);
+        // Add three-phase current injections with proper phase shifts
+        double baseAmplitude = 1.0;  // 1 A (adjust as needed)
+        double frequency = 60.0;     // 60 Hz
+
+        // Generate 3-phase balanced set of currents (with 120° phase shifts)
+        int phaseCount = std::min(3, numNodes);
+        for (int i = 0; i < phaseCount; i++) {
+            double phaseShift = i * 2.0 * M_PI / 3.0;  // 0°, 120°, 240° for 3-phase
+            h_currents_local[i] = baseAmplitude * sin(2.0 * M_PI * frequency * time + phaseShift);
+
+            // Debug output to verify three-phase currents
+            std::cout << "Phase " << i << " current: " << h_currents_local[i]
+                << " A (phase shift: " << (phaseShift * 180.0 / M_PI) << "°)" << std::endl;
+        }
+
+        // Copy the values back to device
+        thrust::copy(h_currents_local.begin(), h_currents_local.end(), d_currents.begin());
+
+        // Debug verification - copy back to host and print
+        thrust::host_vector<double> verification = d_currents;
+        std::cout << "Verification of first 3 currents after copy: ";
+        for (int i = 0; i < std::min(3, numNodes); i++) {
+            std::cout << verification[i] << " ";
+        }
+        std::cout << std::endl;
+    }
+    // Option 2: Use CUDA kernel for calculation
+    else {
+        // Safety checks for kernel launch
+        if (d_historyTerms.size() < numNodes && numNodes > 0) {
+            // Resize history terms if needed
+            std::cout << "Resizing history terms vector to match numNodes" << std::endl;
+            d_historyTerms.resize(numNodes, 0.0);
+        }
+
+        // Use a safe block size based on device capabilities
+        int threadsPerBlock = std::min(256, deviceProp.maxThreadsPerBlock);
+        int numBlocks = (numNodes + threadsPerBlock - 1) / threadsPerBlock;
+
+        // Ensure at least one block for valid launch
+        numBlocks = std::max(1, numBlocks);
+
+        // Log kernel launch parameters
+        std::cout << "Launching updateCurrentVectorKernel with:"
+            << " numNodes=" << numNodes
+            << " threadsPerBlock=" << threadsPerBlock
+            << " numBlocks=" << numBlocks
+            << std::endl;
+
+        // Raw pointers for kernel
+        double* d_currents_ptr = thrust::raw_pointer_cast(d_currents.data());
+        double* d_historyTerms_ptr = (d_historyTerms.size() > 0) ?
+            thrust::raw_pointer_cast(d_historyTerms.data()) : nullptr;
+
+        // Launch the kernel with explicit error checking
+        updateCurrentVectorKernel<<<numBlocks, threadsPerBlock, 0, stream>>>(
+            d_currents_ptr,
+            d_historyTerms_ptr,
+            time,
+            numNodes
+            );
+
+        // Check for launch errors
+        cudaError_t kernelErr = cudaGetLastError();
+        if (kernelErr != cudaSuccess) {
+            std::cerr << "CUDA error in updateCurrentVectorKernel: "
+                << cudaGetErrorString(kernelErr) << std::endl;
+            throw std::runtime_error("CUDA error in updateCurrentVector");
+        }
+
+        // Synchronize to ensure completion (helps with debugging)
+        cudaError_t syncErr = cudaStreamSynchronize(stream);
+        if (syncErr != cudaSuccess) {
+            std::cerr << "CUDA stream synchronization error: "
+                << cudaGetErrorString(syncErr) << std::endl;
+        }
     }
 
-    // Add sine waves with different phases to other nodes to create a balanced system
-    for (int i = 1; i < std::min(3, numNodes); i++) {
-        double amplitude = 1.0;  // 1 A
-        double frequency = 60.0; // 60 Hz
-        double phaseShift = i * 2.0 * M_PI / 3.0;  // 120° phase shifts for 3-phase
-        h_currents_local[i] = amplitude * sin(2.0 * M_PI * frequency * time + phaseShift);
-    }
-
-    // Copy back to device
-    thrust::copy(h_currents_local.begin(), h_currents_local.end(), d_currents.begin());
-
-    // Or use CUDA kernel for more complex operations
-    int threadsPerBlock = 256;
-    int numBlocks = (numNodes + threadsPerBlock - 1) / threadsPerBlock;
-    updateCurrentVectorKernel<<<numBlocks, threadsPerBlock, 0, stream>>>(
-        thrust::raw_pointer_cast(d_currents.data()),
-        thrust::raw_pointer_cast(d_historyTerms.size() > 0 ? d_historyTerms.data() : nullptr),
-        time,
-        numNodes
-        );
+    std::cout << "Current vector update completed for subnetwork " << id << std::endl;
 }
 
 void Subnetwork::solveLinearSystem() {

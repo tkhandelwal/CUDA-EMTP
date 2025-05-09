@@ -139,7 +139,9 @@ LOAD DISTBUS5 LOAD_IND2 40.0 30.0 2
 [SOURCES]
 # Format: Type Node Name Parameters...
 # Grid Voltage Sources: Amplitude (kV) Frequency (Hz) Phase (degrees)
-VOLTAGE MAINBUS1 GRID1 345.0 60.0 0.0
+VOLTAGE MAINBUS1 GRID1_A 345.0 60.0 0.0
+VOLTAGE MAINBUS1 GRID1_B 345.0 60.0 120.0
+VOLTAGE MAINBUS1 GRID1_C 345.0 60.0 240.0
 VOLTAGE MAINBUS4 GRID2 345.0 60.0 -3.0
 
 # Wind Generators: Voltage(V) Frequency(Hz) P(MW) Q(MVAR) Inertia(s) Type(1=DFIG, 2=PMSG)

@@ -1329,7 +1329,7 @@ void EMTPSolver::collectResults(int timeStep) {
     }
 
     // Make sure time is recorded correctly
-    results.timePoints[resultIndex] = timeStep * timeStep;
+    results.timePoints[resultIndex] = timeStep * this->timeStep;
 
     // Collect node voltages with error checking
     for (int subnetID = 0; subnetID < numGPUs; subnetID++) {

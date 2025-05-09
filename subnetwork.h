@@ -24,6 +24,8 @@ private:
     int* d_info;  // Device memory for solver info/error codes
     cudaStream_t stream;
     double timeStep;
+    std::string getCurrentTimeString();
+
 
     // Previous two sets of voltages for extrapolation
     thrust::host_vector<double> prev_voltages;
